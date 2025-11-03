@@ -16,7 +16,7 @@ from config import CONFIG
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-folder_path = "/Users/furkandurmus/Desktop/test"
+folder_path = "your image folder path"  # Set your image folder path here
 
 # Use config settings
 MAX_WORKERS = CONFIG["max_workers"]
