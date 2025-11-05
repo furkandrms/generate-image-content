@@ -16,7 +16,7 @@ from config import CONFIG
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-folder_path = "your image folder path"  # Set your image folder path here
+folder_path = "your folder path"  # Set your image folder path here
 
 # Use config settings
 MAX_WORKERS = CONFIG["max_workers"]
@@ -36,21 +36,69 @@ prompt = CONFIG["prompt_template"]
 
 def parse_response(response_text):
     """Parse the AI response to extract content and hashtags"""
-    content = ""
-    hashtags = []
+    Description = ""
+    Keywords = []
+    Categories = []
+    Editorial = "no"  # Default to no
+    Mature_content = "no"  # Default to no
+    illustration = "no"  # Default to no for photos
+
+    # Extract content/description - look for the main descriptive text
+    # Try different patterns to extract description
+    content_patterns = [
+        r'Description:\s*(.+?)(?=Keywords:|$)',  # Structured format
+        r'^(.+?)(?:#|Keywords:|$)',  # Text before hashtags
+        r'(.+?)(?=\n|$)'  # First line/paragraph
+    ]
     
-    # Extract content
-    content_match = re.search(r'content:\s*(.+?)(?=hashtags:|$)', response_text, re.DOTALL | re.IGNORECASE)
-    if content_match:
-        content = content_match.group(1).strip()
+    for pattern in content_patterns:
+        content_match = re.search(pattern, response_text, re.DOTALL | re.IGNORECASE)
+        if content_match:
+            Description = content_match.group(1).strip()
+            # Clean up common formatting issues
+            Description = re.sub(r'\n+', ' ', Description)  # Replace newlines with spaces
+            Description = re.sub(r'\s+', ' ', Description)  # Replace multiple spaces with single space
+            Description = Description.strip('"\'')  # Remove quotes
+            if Description and len(Description) > 10:  # Make sure we have substantial content
+                break
     
-    # Extract hashtags
-    hashtags_match = re.search(r'hashtags:\s*\[(.*?)\]', response_text, re.DOTALL | re.IGNORECASE)
-    if hashtags_match:
-        hashtags_text = hashtags_match.group(1)
-        hashtags = [tag.strip().strip('"\'') for tag in hashtags_text.split(',') if tag.strip()]
+    # If no structured description found, use the whole response (cleaned)
+    if not Description or len(Description) < 10:
+        Description = response_text.strip()
+        Description = re.sub(r'\n+', ' ', Description)
+        Description = re.sub(r'\s+', ' ', Description)
+        Description = Description.strip('"\'')
+
+    # Extract keywords - try multiple patterns
+    keywords_patterns = [
+        r'Keywords:\s*\[(.*?)\]',  # [keyword1, keyword2]
+        r'Keywords:\s*(.+?)(?=\n|$)',  # Keywords: keyword1, keyword2
+        r'#(\w+)',  # #hashtags
+        r'(?:^|\s)#([^\s,]+)',  # hashtags with boundaries
+    ]
     
-    return content, hashtags
+    for pattern in keywords_patterns:
+        keywords_match = re.findall(pattern, response_text, re.DOTALL | re.IGNORECASE)
+        if keywords_match:
+            if pattern.startswith(r'Keywords:'):
+                # Handle comma-separated keywords
+                keywords_text = keywords_match[0] if keywords_match else ""
+                Keywords = [tag.strip().strip('"\'') for tag in keywords_text.split(',') if tag.strip()]
+            else:
+                # Handle hashtag format
+                Keywords = [tag.strip() for tag in keywords_match if tag.strip()]
+            break
+    
+    # Clean up keywords
+    Keywords = [kw for kw in Keywords if kw and len(kw) > 1]  # Remove empty or single char keywords
+    
+    # Extract categories if mentioned
+    categories_match = re.search(r'Categories?:\s*(.+?)(?=\n|$)', response_text, re.IGNORECASE)
+    if categories_match:
+        categories_text = categories_match.group(1)
+        Categories = [cat.strip().strip('"\'') for cat in categories_text.split(',') if cat.strip()]
+
+    return Description, Keywords, Categories, Editorial, Mature_content, illustration
 
 def image_to_text_single(file_path, prompt, client, max_retries=None):
     """Process single image with quota checking and retry mechanism"""
@@ -60,7 +108,7 @@ def image_to_text_single(file_path, prompt, client, max_retries=None):
     if not quota_tracker.can_process():
         remaining = quota_tracker.get_remaining()
         print(f"Daily quota exceeded ({quota_tracker.used_today}/{MAX_DAILY_QUOTA}). Remaining: {remaining}")
-        return file_path, "Error: Daily quota exceeded", []
+        return file_path, "Error: Daily quota exceeded", [], [], "no", "no", "no"
     
     for attempt in range(max_retries):
         try:
@@ -75,7 +123,7 @@ def image_to_text_single(file_path, prompt, client, max_retries=None):
             )
 
             response_text = response.text
-            content, hashtags = parse_response(response_text)
+            description, keywords, categories, editorial, mature_content, illustration = parse_response(response_text)
             
             # Clean up uploaded file if API supports it
             try:
@@ -86,13 +134,26 @@ def image_to_text_single(file_path, prompt, client, max_retries=None):
             # After successful processing, update quota
             quota_tracker.add_usage(1)
             
-            return file_path, content, hashtags
+            return file_path, description, keywords, categories, editorial, mature_content, illustration
         
         except Exception as e:
             error_str = str(e)
             
+            # Check if it's a 503 service unavailable error
+            if "503" in error_str or "UNAVAILABLE" in error_str or "overloaded" in error_str.lower():
+                retry_delay = CONFIG["initial_backoff"] * (attempt + 1)  # Progressive delay
+                retry_delay = min(retry_delay, CONFIG["max_backoff"])
+                
+                if attempt < max_retries - 1:
+                    print(f"Model overloaded for {file_path}. Waiting {retry_delay:.1f}s before retry {attempt + 1}/{max_retries}")
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    print(f"Model still overloaded after {max_retries} retries for {file_path}")
+                    return file_path, "Error: Model overloaded", [], [], "no", "no", "no"
+            
             # Check if it's a quota/rate limit error
-            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+            elif "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
                 # Extract retry delay from error message if available
                 retry_delay = CONFIG["initial_backoff"]  # Use config value
                 
@@ -116,13 +177,13 @@ def image_to_text_single(file_path, prompt, client, max_retries=None):
                     continue
                 else:
                     print(f"Max retries reached for {file_path}: {error_str}")
-                    return file_path, "Error: Quota exhausted after retries", []
+                    return file_path, "Error: Quota exhausted after retries", [], [], "no", "no", "no"
             else:
                 # For other errors, don't retry
                 print(f"Error processing {file_path}: {str(e)}")
-                return file_path, "Error generating content", []
+                return file_path, "Error generating content", [], [], "no", "no", "no"
     
-    return file_path, "Error: Max retries exceeded", []
+    return file_path, "Error: Max retries exceeded", [], [], "no", "no", "no"
 
 def process_batch(file_paths, prompt, client):
     """Process a batch of images"""
@@ -154,25 +215,43 @@ def load_processed_files(csv_path):
                 reader = csv.reader(file)
                 next(reader, None)  # Skip header
                 for row in reader:
-                    if row and len(row) > 0:
+                    if row and len(row) >= 1:  # At least filename should exist
                         processed_files.add(row[0])  # file_name column
         except Exception as e:
             print(f"Warning: Could not load processed files: {e}")
     return processed_files
 
 def save_to_csv_optimized(data, csv_path, append_mode=False):
-    """Optimized CSV saving with progress"""
+    """Optimized CSV saving with Shutterstock format"""
     mode = "a" if append_mode and os.path.exists(csv_path) else "w"
     write_header = mode == "w"
     
-    with open(csv_path, mode=mode, newline="", encoding="utf-8") as csv_file:
+    # Use UTF-8 with BOM for better compatibility with Shutterstock
+    encoding = "utf-8-sig" if write_header else "utf-8"
+    
+    with open(csv_path, mode=mode, newline="", encoding=encoding) as csv_file:
         writer = csv.writer(csv_file)
         if write_header:
-            writer.writerow(["file_name", "response_text", "hashtags"])
+            writer.writerow(["Filename", "Description", "Keywords", "Categories", "Editorial", "Mature content", "illustration"])
         
-        for file_path, caption, hashtags in tqdm.tqdm(data, desc="Saving to CSV", unit="row"):
+        for file_path, description, keywords, categories, editorial, mature_content, illustration in tqdm.tqdm(data, desc="Saving to CSV", unit="row"):
             file_name = Path(file_path).name
-            writer.writerow([file_name, caption, ", ".join(hashtags)])
+            
+            # Format keywords as comma-separated string
+            keywords_str = ",".join(keywords) if keywords else ""
+            
+            # Format categories as comma-separated string
+            categories_str = ",".join(categories) if categories else ""
+            
+            writer.writerow([
+                file_name, 
+                description, 
+                keywords_str, 
+                categories_str, 
+                editorial, 
+                mature_content, 
+                illustration
+            ])
 
 def create_batches(items, batch_size):
     """Split items into batches"""
